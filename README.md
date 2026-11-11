@@ -7,11 +7,11 @@ Download opc file and just type in your terminal `bash path_to_opc/opc`. You wil
 
 ```
 opc - just connection
-opc -help` - list of commands
-opc -new` - deletes previous Colab session and creates a new one
-opc file.txt` or `opc file.txt file2.txt` - connects and uploads selected files
-opc -all` connect and uploads all files from current directory
-opc -api` - change saved provider and API key
-opc -sshkey` - change saved SSH key for Github connection
-opc -collect` - downloads all files from the current Colab session as .zip archive
+opc -help : list of commands
+opc -new : deletes previous Colab session and creates a new one
+opc file.txt` or `opc file.txt file2.txt : connects and uploads selected files
+opc -all : connect and uploads all files from current directory
+opc -api : change saved provider and API key
+opc -sshkey : change saved SSH key for Github connection
+opc -collect : downloads all files from the current Colab session as .zip archive
 ```
