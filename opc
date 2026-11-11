@@ -1,0 +1,1389 @@
+#!/usr/bin/env bash
+
+# Установщик команды 'opc' (Google Colab + OpenCode 2).
+# Скопируй этот файл на целевую машину и запусти:
+#     ./opc
+#
+# Установщик делает ВСЁ сам:
+#   • ставит python3 и pip, если их нет;
+#   • ставит Google Colab CLI (pip install google-colab-cli);
+#   • спрашивает провайдера, модель и API ключ;
+#   • спрашивает папку с GitHub SSH-ключами (или генерирует новые);
+#   • добавляет ~/bin в PATH (в ~/.bashrc или ~/.profile);
+#   • создаёт ~/bin/opc и делает её исполняемой;
+#   • сохраняет прежнюю версию как ~/bin/opc.backup.
+#
+# Сама команда opc НИЧЕГО не ставит — она только проверяет
+# и использует то, что подготовил установщик.
+#
+# Останется сделать вручную на новой машине:
+#   • авторизация Google (colab выполнит её при первом запуске)
+
+set -euo pipefail
+
+CONFIG_DIR="$HOME/.config/colab-opencode"
+API_KEY_FILE="$CONFIG_DIR/api_key"
+SSH_KEY_DIR_FILE="$CONFIG_DIR/ssh_key_dir"
+PROVIDER_FILE="$CONFIG_DIR/provider.json"
+
+mkdir -p "$HOME/bin" "$CONFIG_DIR"
+
+if [[ -f "$HOME/bin/opc" ]]; then
+    cp "$HOME/bin/opc" "$HOME/bin/opc.backup"
+fi
+
+# ============================================================
+# BOOTSTRAP: python3 + pip + Google Colab CLI
+# ============================================================
+
+run_as_root() {
+    if [[ $(id -u) -eq 0 ]]; then
+        "$@"
+    elif command -v sudo >/dev/null 2>&1; then
+        sudo "$@"
+    else
+        "$@"
+    fi
+}
+
+ensure_python() {
+    command -v python3 >/dev/null 2>&1 && return 0
+    command -v python >/dev/null 2>&1 && return 0
+
+    echo "[opc] python3 not found, installing..."
+
+    if command -v apt-get >/dev/null 2>&1; then
+        run_as_root apt-get update -qq
+        run_as_root apt-get install -y -qq python3 python3-pip curl ca-certificates
+    elif command -v pkg >/dev/null 2>&1; then
+        pkg install -y python python-pip curl
+    elif command -v dnf >/dev/null 2>&1; then
+        run_as_root dnf install -y python3 python3-pip curl
+    elif command -v pacman >/dev/null 2>&1; then
+        run_as_root pacman -Sy --noconfirm python python-pip curl
+    else
+        echo "[opc] ERROR: cannot install python3 automatically." >&2
+        exit 1
+    fi
+}
+
+ensure_pip() {
+    local py
+    py="$(command -v python3 || command -v python)"
+
+    if "$py" -m pip --version >/dev/null 2>&1; then
+        return 0
+    fi
+
+    echo "[opc] pip not found, installing..."
+
+    if command -v apt-get >/dev/null 2>&1; then
+        run_as_root apt-get install -y -qq python3-pip
+    elif command -v pkg >/dev/null 2>&1; then
+        pkg install -y python-pip
+    else
+        echo "[opc] ERROR: cannot install pip automatically." >&2
+        exit 1
+    fi
+}
+
+ensure_colab_cli() {
+    local py
+    py="$(command -v python3 || command -v python)"
+
+    if ! command -v colab >/dev/null 2>&1; then
+        echo "[opc] Installing Google Colab CLI..."
+
+        if "$py" -m pip install --user --upgrade google-colab-cli; then
+            :
+        elif "$py" -m pip install --user --break-system-packages --upgrade google-colab-cli; then
+            :
+        else
+            echo "[opc] ERROR: cannot install google-colab-cli." >&2
+            echo "[opc] Try manually: $py -m pip install --user --upgrade google-colab-cli" >&2
+            exit 1
+        fi
+    else
+        echo "[opc] Checking for Google Colab CLI updates..."
+
+        "$py" -m pip install --user --upgrade google-colab-cli --quiet 2>/dev/null || \
+        "$py" -m pip install --user --break-system-packages --upgrade google-colab-cli --quiet 2>/dev/null || true
+    fi
+}
+
+ensure_path() {
+    local rc
+    if [[ -f "$HOME/.bashrc" ]]; then
+        rc="$HOME/.bashrc"
+    else
+        rc="$HOME/.profile"
+    fi
+
+    if ! grep -q 'PATH="$HOME/bin:$PATH"' "$rc" 2>/dev/null; then
+        printf '\n# added by opc installer\nexport PATH="$HOME/bin:$PATH"\n' >> "$rc"
+        echo "[opc] Added ~/bin to PATH in $rc"
+    fi
+}
+
+has_ssh_pair() {
+    local dir="$1" pub priv
+
+    for pub in "$dir"/*.pub; do
+        [[ -e "$pub" ]] || continue
+        priv="${pub%.pub}"
+        if [[ -f "$priv" && -s "$priv" ]]; then
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+ask_provider() {
+    local -a db
+    db=(
+        "inception|Inception|@opencode/ai/providers/openai-compatible|https://api.inceptionlabs.ai/v1|INCEPTION_API_KEY|mercury-3|mercury-3,mercury-2.5,mercury-2,mercury,mercury-coder-small,mercury-coder-mini"
+        "openai|OpenAI|@opencode/ai/providers/openai||OPENAI_API_KEY|gpt-6.1-sol|gpt-6.1-terra,gpt-6.1-sol,gpt-6-sol,gpt-6-luna,gpt-6-astra,gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna,gpt-5.5,gpt-5.4"
+        "anthropic|Anthropic (Claude)|@opencode/ai/providers/anthropic||ANTHROPIC_API_KEY|claude-sonnet-5-5|claude-opus-5-5,claude-sonnet-5-5,claude-haiku-5-5,claude-fable-5-1,claude-opus-5,claude-sonnet-5,claude-opus-4-8,claude-opus-4-7,claude-sonnet-4-6"
+        "google|Google Gemini|@opencode/ai/providers/google||GEMINI_API_KEY|gemini-2.5-pro|gemini-3-pro,gemini-3-flash,gemini-2.5-pro,gemini-2.5-flash,gemini-2.0-flash"
+        "xai|xAI (Grok)|@opencode/ai/providers/xai||XAI_API_KEY|grok-4|grok-4,grok-4-fast,grok-3,grok-code"
+        "mistral|Mistral|@opencode/ai/providers/openai-compatible|https://api.mistral.ai/v1|MISTRAL_API_KEY|mistral-large-latest|mistral-large-latest,mistral-small-latest,codestral-latest,ministral-3b"
+        "groq|Groq|@opencode/ai/providers/openai-compatible|https://api.groq.com/openai/v1|GROQ_API_KEY|llama-3.3-70b-versatile|llama-3.3-70b-versatile,meta-llama/llama-4-scout-17b-16e-instruct,llama-3.1-8b-instant,deepseek-r1-distill-llama-70b,qwen/qwen3-32b"
+        "deepseek|DeepSeek|@opencode/ai/providers/openai-compatible|https://api.deepseek.com/v1|DEEPSEEK_API_KEY|deepseek-chat|deepseek-chat,deepseek-reasoner"
+        "openrouter|OpenRouter|@opencode/ai/providers/openrouter||OPENROUTER_API_KEY|anthropic/claude-sonnet-5-5|anthropic/claude-sonnet-5-5,openai/gpt-6.1-sol,google/gemini-3-pro,meta-llama/llama-3.3-70b-instruct,deepseek/deepseek-chat,mistralai/mistral-large-latest,x-ai/grok-4,cohere/command-a,amazon/nova-pro"
+        "together|Together AI|@opencode/ai/providers/openai-compatible|https://api.together.xyz/v1|TOGETHER_API_KEY|meta-llama/Llama-3.3-70B-Instruct-Turbo|meta-llama/Llama-3.3-70B-Instruct-Turbo,meta-llama/Llama-4-Scout-17B-16E-Instruct,Qwen/Qwen3-Coder-30B-A3B-Instruct,deepseek-ai/DeepSeek-V3.2"
+        "cerebras|Cerebras|@opencode/ai/providers/openai-compatible|https://api.cerebras.ai/v1|CEREBRAS_API_KEY|meta-llama/llama-3.3-70b-instruct|meta-llama/llama-3.3-70b-instruct,meta-llama/llama-4-scout-17b-16e-instruct,qwen/qwen3-32b"
+        "ollama|Ollama (local)|@opencode/ai/providers/openai-compatible|http://127.0.0.1:11434/v1||qwen3:8b|qwen3:8b,llama3.3:70b,llama3.1:8b,phi4:14b,mistral:7b"
+        "lmstudio|LM Studio (local)|@opencode/ai/providers/openai-compatible|http://127.0.0.1:1234/v1||qwen3-coder-30b|qwen3-coder-30b,llama-3.3-70b,qwen3:32b,phi-4:14b,mistral-small:24b"
+        "custom|Other (OpenAI-compatible)|@opencode/ai/providers/openai-compatible|ASK|ASK|ASK|"
+    )
+
+    local i=1 e name disp pkg base_url env def_model models ans key model mchoice
+    local -a mlist
+
+    echo
+    echo "[opc] Choose your AI provider:"
+
+    for e in "${db[@]}"; do
+        printf '  %2d) %s\n' "$i" "$(printf '%s' "$e" | cut -d'|' -f2)"
+        i=$((i+1))
+    done
+
+    read -r -p "[opc] Number [1-$((i-1))]: " ans
+    [[ "$ans" =~ ^[0-9]+$ ]] && (( ans >= 1 && ans < i )) || {
+        echo "[opc] ERROR: invalid choice." >&2
+        return 1
+    }
+
+    e="${db[$((ans-1))]}"
+    IFS='|' read -r name disp pkg base_url env def_model models <<< "$e"
+
+    if [[ "$name" == "custom" ]]; then
+        read -r -p "[opc] Provider name: " name
+        [[ -n "$name" ]] || {
+            echo "[opc] ERROR: provider name required." >&2
+            return 1
+        }
+        read -r -p "[opc] Base URL (e.g. https://api.example.com/v1): " base_url
+        [[ -n "$base_url" ]] || {
+            echo "[opc] ERROR: base URL required." >&2
+            return 1
+        }
+        env="$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]' | tr -cs '[:alnum:]' '_')_API_KEY"
+    fi
+
+    key=""
+    if [[ -n "$env" ]]; then
+        read -rsp "[opc] API key for $disp: " key
+        echo
+    fi
+
+    if [[ -n "$models" ]]; then
+        IFS=',' read -ra mlist <<< "$models"
+
+        echo
+        echo "[opc] Choose model:"
+
+        local mi=1 m
+        for m in "${mlist[@]}"; do
+            printf '  %2d) %s\n' "$mi" "$m"
+            mi=$((mi+1))
+        done
+
+        read -r -p "[opc] Number [1-$((mi-1))], or type a custom model ID: " mchoice
+
+        if [[ "$mchoice" =~ ^[0-9]+$ ]] && (( mchoice >= 1 && mchoice < mi )); then
+            model="${mlist[$((mchoice-1))]}"
+        else
+            model="$mchoice"
+        fi
+    else
+        read -r -p "[opc] Model: " model
+    fi
+
+    [[ -n "$model" ]] || {
+        echo "[opc] ERROR: model required." >&2
+        return 1
+    }
+
+    python3 - "$PROVIDER_FILE" "$name" "$disp" "$pkg" "$base_url" "$env" "$key" "$model" <<'PY'
+import json
+import sys
+
+path, name, disp, pkg, base_url, env_var, key, model = sys.argv[1:]
+
+data = {
+    "name": name,
+    "label": disp,
+    "package": pkg,
+    "base_url": base_url,
+    "env": env_var,
+    "api_key": key,
+    "model": model,
+    "limit_context": 1000000,
+    "limit_output": 131072,
+}
+
+with open(path, "w") as f:
+    json.dump(data, f, indent=2)
+PY
+
+    chmod 600 "$PROVIDER_FILE"
+    echo "[opc] Provider saved: $disp ($model)"
+}
+
+ensure_ssh_keygen() {
+    command -v ssh-keygen >/dev/null 2>&1 && return 0
+
+    echo "[opc] Installing ssh-keygen (openssh-client)..."
+
+    if command -v apt-get >/dev/null 2>&1; then
+        run_as_root apt-get update -qq
+        run_as_root apt-get install -y -qq openssh-client
+    elif command -v pkg >/dev/null 2>&1; then
+        pkg install -y openssh
+    elif command -v dnf >/dev/null 2>&1; then
+        run_as_root dnf install -y openssh-clients
+    elif command -v pacman >/dev/null 2>&1; then
+        run_as_root pacman -Sy --noconfirm openssh
+    else
+        echo "[opc] WARNING: cannot install ssh-keygen automatically." >&2
+        return 1
+    fi
+}
+
+ask_sshkey_dir() {
+    local dir default ans
+    default="$HOME/.ssh"
+
+    if [[ -d "$HOME/storage/downloads" ]]; then
+        default="$HOME/storage/downloads"
+    fi
+
+    echo
+    read -r -p "[opc] Do you already have GitHub SSH keys? [y/N]: " ans
+
+    if [[ "$ans" =~ ^[yY] ]]; then
+        while true; do
+            read -r -p "[opc] Folder with your keys: " dir
+            dir="${dir/#\~/$HOME}"
+            [[ -n "$dir" ]] && break
+            echo "[opc] Path cannot be empty." >&2
+        done
+
+        if ! has_ssh_pair "$dir"; then
+            echo "[opc] WARNING: no SSH key pair (private + .pub) found in $dir" >&2
+            read -r -p "[opc] Save folder anyway? [y/N]: " ans
+            [[ "$ans" =~ ^[yY] ]] || {
+                echo "[opc] Aborted, folder not saved."
+                return 1
+            }
+        fi
+    else
+        echo "[opc] OK, I will generate a new GitHub SSH key pair."
+
+        if ! ensure_ssh_keygen; then
+            echo "[opc] Cancelled." >&2
+            return 1
+        fi
+
+        while true; do
+            read -r -p "[opc] Where to save the keys: " dir
+            dir="${dir/#\~/$HOME}"
+            [[ -n "$dir" ]] && break
+            echo "[opc] Path cannot be empty." >&2
+        done
+        mkdir -p "$dir"
+        chmod 700 "$dir"
+
+        ssh-keygen -q -t ed25519 -C "opc-github" -f "$dir/github_opencode" -N ""
+
+        chmod 600 "$dir/github_opencode"
+        chmod 644 "$dir/github_opencode.pub"
+
+        echo
+        echo "[opc] Keys created:"
+        echo "[opc]   private: $dir/github_opencode"
+        echo "[opc]   public:  $dir/github_opencode.pub"
+        echo
+        echo "[opc] ============================================================"
+        echo "[opc] Add the PUBLIC key to GitHub:"
+        echo "[opc]   1. Open https://github.com/settings/ssh/new"
+        echo "[opc]   2. Title: anything (e.g. \"opc-machine\")"
+        echo "[opc]   3. Key type: Authentication Key"
+        echo "[opc]   4. Paste the line below into the Key field:"
+        echo
+        cat "$dir/github_opencode.pub"
+        echo
+        echo "[opc]   5. Click 'Add SSH key'."
+        echo "[opc] ============================================================"
+    fi
+
+    printf '%s' "$dir" > "$SSH_KEY_DIR_FILE"
+    chmod 600 "$SSH_KEY_DIR_FILE"
+    echo "[opc] SSH key folder saved: $dir"
+}
+
+# Make freshly installed tools visible in this session
+export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
+
+ensure_python
+ensure_pip
+ensure_colab_cli
+ensure_path
+
+ask_provider || true
+ask_sshkey_dir || true
+
+cat > "$HOME/bin/opc" <<'EOF'
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+
+# ============================================================
+# SSH KEY PAIR DISCOVERY
+# ============================================================
+
+find_ssh_keys() {
+    local dir="$1"
+    local pub priv
+
+    SSH_KEY_FILE=""
+    SSH_PUB_FILE=""
+
+    # Exact known names take priority
+    if [[ -f "$dir/github_opencode" && -f "$dir/github_opencode.pub" ]]; then
+        SSH_KEY_FILE="$dir/github_opencode"
+        SSH_PUB_FILE="$dir/github_opencode.pub"
+        return 0
+    fi
+
+    # Otherwise: any *.pub with a matching private key beside it
+    for pub in "$dir"/*.pub; do
+        [[ -e "$pub" ]] || continue
+        priv="${pub%.pub}"
+        if [[ -f "$priv" && -s "$priv" ]]; then
+            SSH_KEY_FILE="$priv"
+            SSH_PUB_FILE="$pub"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+SESSION="opencode"
+
+CONFIG_DIR="$HOME/.config/colab-opencode"
+API_KEY_FILE="$CONFIG_DIR/api_key"
+
+SSH_KEY_DIR_FILE="$CONFIG_DIR/ssh_key_dir"
+
+PROVIDER_FILE="$CONFIG_DIR/provider.json"
+
+SSH_KEY_DIR=""
+if [[ -s "$SSH_KEY_DIR_FILE" ]]; then
+    SSH_KEY_DIR="$(cat "$SSH_KEY_DIR_FILE")"
+fi
+
+if [[ -n "$SSH_KEY_DIR" ]]; then
+    find_ssh_keys "$SSH_KEY_DIR" || true
+fi
+
+DOWNLOAD_DIR="$HOME/storage/downloads"
+
+if [[ ! -d "$DOWNLOAD_DIR" ]]; then
+    DOWNLOAD_DIR="$HOME/Downloads"
+fi
+
+if [[ ! -d "$DOWNLOAD_DIR" ]]; then
+    DOWNLOAD_DIR="$HOME"
+fi
+
+export PATH="$HOME/.local/bin:$HOME/bin:$PATH"
+
+if command -v python >/dev/null 2>&1; then
+    PY=python
+else
+    PY=python3
+fi
+
+TMP_DIR="$(mktemp -d)"
+trap 'rm -rf "$TMP_DIR"' EXIT
+
+mkdir -p "$CONFIG_DIR" "$DOWNLOAD_DIR"
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+log() {
+    echo "[opc] $*"
+}
+
+die() {
+    echo "[opc] ERROR: $*" >&2
+    exit 1
+}
+
+# ============================================================
+# PROVIDER
+# ============================================================
+
+ensure_provider() {
+
+    if [[ ! -s "$PROVIDER_FILE" ]]; then
+        die "No provider configured. Set it up with: opc -api"
+    fi
+}
+
+# ============================================================
+# SESSION
+# ============================================================
+
+ensure_session() {
+
+    local status
+
+    status="$(colab status -s "$SESSION" 2>&1 || true)"
+
+    if grep -Fq "Session '$SESSION' not found" <<< "$status"; then
+        log "Creating CPU session..."
+        colab new -s "$SESSION"
+    else
+        log "Using existing session."
+    fi
+}
+
+# ============================================================
+# RECREATE SESSION
+# ============================================================
+
+recreate_session() {
+
+    log "Stopping old session '$SESSION' (if any)..."
+
+    colab stop -s "$SESSION" >/dev/null 2>&1 || true
+
+    log "Creating a fresh session '$SESSION'..."
+
+    colab new -s "$SESSION"
+
+    check_local_files
+    ensure_provider
+    upload_secrets
+    setup_opencode
+}
+
+# ============================================================
+# SSH KEY FOLDER
+# ============================================================
+
+set_sshkey_dir() {
+    local dir ans
+
+    echo
+    read -r -p "[opc] Do you already have GitHub SSH keys? [y/N]: " ans
+
+    if [[ "$ans" =~ ^[yY] ]]; then
+        while true; do
+            read -r -p "[opc] Folder with your keys: " dir
+            dir="${dir/#\~/$HOME}"
+            [[ -n "$dir" ]] && break
+            echo "[opc] Path cannot be empty." >&2
+        done
+
+        if ! find_ssh_keys "$dir"; then
+            echo "[opc] WARNING: no SSH key pair found in $dir" >&2
+            read -r -p "[opc] Save folder anyway? [y/N]: " ans
+            [[ "$ans" =~ ^[yY] ]] || die "Aborted."
+        fi
+    else
+        if ! command -v ssh-keygen >/dev/null 2>&1; then
+            die "ssh-keygen is not installed. Run the installer first: ./opc"
+        fi
+
+        while true; do
+            read -r -p "[opc] Where to save the keys: " dir
+            dir="${dir/#\~/$HOME}"
+            [[ -n "$dir" ]] && break
+            echo "[opc] Path cannot be empty." >&2
+        done
+        mkdir -p "$dir"
+        chmod 700 "$dir"
+
+        ssh-keygen -q -t ed25519 -C "opc-github" -f "$dir/github_opencode" -N ""
+
+        chmod 600 "$dir/github_opencode"
+        chmod 644 "$dir/github_opencode.pub"
+
+        echo
+        echo "[opc] Add this PUBLIC key to GitHub:"
+        echo "[opc] https://github.com/settings/ssh/new"
+        echo
+        cat "$dir/github_opencode.pub"
+        echo
+    fi
+
+    printf '%s' "$dir" > "$SSH_KEY_DIR_FILE"
+    chmod 600 "$SSH_KEY_DIR_FILE"
+    log "SSH key folder saved: $dir"
+}
+
+# ============================================================
+# PROVIDER
+# ============================================================
+
+set_provider() {
+    local -a db
+    db=(
+        "inception|Inception|@opencode/ai/providers/openai-compatible|https://api.inceptionlabs.ai/v1|INCEPTION_API_KEY|mercury-3|mercury-3,mercury-2.5,mercury-2,mercury,mercury-coder-small,mercury-coder-mini"
+        "openai|OpenAI|@opencode/ai/providers/openai||OPENAI_API_KEY|gpt-6.1-sol|gpt-6.1-terra,gpt-6.1-sol,gpt-6-sol,gpt-6-luna,gpt-6-astra,gpt-5.6-sol,gpt-5.6-terra,gpt-5.6-luna,gpt-5.5,gpt-5.4"
+        "anthropic|Anthropic (Claude)|@opencode/ai/providers/anthropic||ANTHROPIC_API_KEY|claude-sonnet-5-5|claude-opus-5-5,claude-sonnet-5-5,claude-haiku-5-5,claude-fable-5-1,claude-opus-5,claude-sonnet-5,claude-opus-4-8,claude-opus-4-7,claude-sonnet-4-6"
+        "google|Google Gemini|@opencode/ai/providers/google||GEMINI_API_KEY|gemini-2.5-pro|gemini-3-pro,gemini-3-flash,gemini-2.5-pro,gemini-2.5-flash,gemini-2.0-flash"
+        "xai|xAI (Grok)|@opencode/ai/providers/xai||XAI_API_KEY|grok-4|grok-4,grok-4-fast,grok-3,grok-code"
+        "mistral|Mistral|@opencode/ai/providers/openai-compatible|https://api.mistral.ai/v1|MISTRAL_API_KEY|mistral-large-latest|mistral-large-latest,mistral-small-latest,codestral-latest,ministral-3b"
+        "groq|Groq|@opencode/ai/providers/openai-compatible|https://api.groq.com/openai/v1|GROQ_API_KEY|llama-3.3-70b-versatile|llama-3.3-70b-versatile,meta-llama/llama-4-scout-17b-16e-instruct,llama-3.1-8b-instant,deepseek-r1-distill-llama-70b,qwen/qwen3-32b"
+        "deepseek|DeepSeek|@opencode/ai/providers/openai-compatible|https://api.deepseek.com/v1|DEEPSEEK_API_KEY|deepseek-chat|deepseek-chat,deepseek-reasoner"
+        "openrouter|OpenRouter|@opencode/ai/providers/openrouter||OPENROUTER_API_KEY|anthropic/claude-sonnet-5-5|anthropic/claude-sonnet-5-5,openai/gpt-6.1-sol,google/gemini-3-pro,meta-llama/llama-3.3-70b-instruct,deepseek/deepseek-chat,mistralai/mistral-large-latest,x-ai/grok-4,cohere/command-a,amazon/nova-pro"
+        "together|Together AI|@opencode/ai/providers/openai-compatible|https://api.together.xyz/v1|TOGETHER_API_KEY|meta-llama/Llama-3.3-70B-Instruct-Turbo|meta-llama/Llama-3.3-70B-Instruct-Turbo,meta-llama/Llama-4-Scout-17B-16E-Instruct,Qwen/Qwen3-Coder-30B-A3B-Instruct,deepseek-ai/DeepSeek-V3.2"
+        "cerebras|Cerebras|@opencode/ai/providers/openai-compatible|https://api.cerebras.ai/v1|CEREBRAS_API_KEY|meta-llama/llama-3.3-70b-instruct|meta-llama/llama-3.3-70b-instruct,meta-llama/llama-4-scout-17b-16e-instruct,qwen/qwen3-32b"
+        "ollama|Ollama (local)|@opencode/ai/providers/openai-compatible|http://127.0.0.1:11434/v1||qwen3:8b|qwen3:8b,llama3.3:70b,llama3.1:8b,phi4:14b,mistral:7b"
+        "lmstudio|LM Studio (local)|@opencode/ai/providers/openai-compatible|http://127.0.0.1:1234/v1||qwen3-coder-30b|qwen3-coder-30b,llama-3.3-70b,qwen3:32b,phi-4:14b,mistral-small:24b"
+        "custom|Other (OpenAI-compatible)|@opencode/ai/providers/openai-compatible|ASK|ASK|ASK|"
+    )
+
+    local cur=""
+    if [[ -f "$PROVIDER_FILE" ]]; then
+        cur="$("$PY" -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+print(d.get("name",""))' "$PROVIDER_FILE" 2>/dev/null || true)"
+    fi
+
+    echo
+    echo "[opc] Current provider: ${cur:-<not set>}"
+    echo "[opc] Choose provider:"
+
+    local i=1 e name disp pkg base_url env def_model models ans key model mchoice
+    local -a mlist
+    for e in "${db[@]}"; do
+        printf '  %2d) %s\n' "$i" "$(printf '%s' "$e" | cut -d'|' -f2)"
+        i=$((i+1))
+    done
+
+    read -r -p "[opc] Number [1-$((i-1))]: " ans
+    [[ "$ans" =~ ^[0-9]+$ ]] && (( ans >= 1 && ans < i )) || die "Invalid choice."
+
+    e="${db[$((ans-1))]}"
+    IFS='|' read -r name disp pkg base_url env def_model models <<< "$e"
+
+    if [[ "$name" == "custom" ]]; then
+        read -r -p "[opc] Provider name: " name
+        [[ -n "$name" ]] || die "Provider name is required."
+        read -r -p "[opc] Base URL (e.g. https://api.example.com/v1): " base_url
+        [[ -n "$base_url" ]] || die "Base URL is required."
+        env="$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]' | tr -cs '[:alnum:]' '_')_API_KEY"
+    fi
+
+    key=""
+    if [[ -n "$env" ]]; then
+        read -rsp "[opc] API key for $disp: " key
+        echo
+    fi
+
+    if [[ -n "$models" ]]; then
+        IFS=',' read -ra mlist <<< "$models"
+
+        echo
+        echo "[opc] Choose model:"
+
+        local mi=1 m
+        for m in "${mlist[@]}"; do
+            printf '  %2d) %s\n' "$mi" "$m"
+            mi=$((mi+1))
+        done
+
+        read -r -p "[opc] Number [1-$((mi-1))], or type a custom model ID: " mchoice
+
+        if [[ "$mchoice" =~ ^[0-9]+$ ]] && (( mchoice >= 1 && mchoice < mi )); then
+            model="${mlist[$((mchoice-1))]}"
+        else
+            model="$mchoice"
+        fi
+    else
+        read -r -p "[opc] Model: " model
+    fi
+
+    [[ -n "$model" ]] || die "Model is required."
+
+    "$PY" - "$PROVIDER_FILE" "$name" "$disp" "$pkg" "$base_url" "$env" "$key" "$model" <<'PY'
+import json
+import sys
+
+path, name, disp, pkg, base_url, env_var, key, model = sys.argv[1:]
+
+data = {
+    "name": name,
+    "label": disp,
+    "package": pkg,
+    "base_url": base_url,
+    "env": env_var,
+    "api_key": key,
+    "model": model,
+    "limit_context": 1000000,
+    "limit_output": 131072,
+}
+
+with open(path, "w") as f:
+    json.dump(data, f, indent=2)
+PY
+
+    chmod 600 "$PROVIDER_FILE"
+    log "Provider saved: $disp ($model)"
+}
+
+# ============================================================
+# HELP
+# ============================================================
+
+show_help() {
+    cat <<'HELP'
+Usage: opc [command]
+
+  (no arguments)    full provisioning, then connect over SSH
+  -help             show this help
+  -api              configure provider, model and API key
+  -sshkey           choose or generate GitHub SSH keys
+  -provider         alias for -api
+  -new              destroy current session and create a fresh one
+  -collect          download the remote workspace archive
+  -all              provisioning + upload all files + connect
+  <files...>        upload listed files, then connect
+HELP
+}
+
+# ============================================================
+# CHECK LOCAL FILES
+# ============================================================
+
+check_local_files() {
+
+    command -v colab >/dev/null ||
+        die "Google Colab CLI is not installed. Run the installer first: ./opc (установщик)"
+
+    if [[ -z "$SSH_KEY_DIR" ]]; then
+        die "SSH key folder is not configured. Choose it with: opc -sshkey (or run the installer)"
+    fi
+
+    if [[ -z "$SSH_KEY_FILE" ]]; then
+        die "No SSH key pair found in $SSH_KEY_DIR. Expected a private key with a matching .pub file."
+    fi
+
+    [[ -s "$SSH_KEY_FILE" ]] ||
+        die "GitHub private key not readable: $SSH_KEY_FILE"
+
+    [[ -s "$SSH_PUB_FILE" ]] ||
+        die "GitHub public key not readable: $SSH_PUB_FILE"
+
+    chmod 600 "$SSH_KEY_FILE"
+    chmod 644 "$SSH_PUB_FILE"
+
+    command -v python >/dev/null ||
+        command -v python3 >/dev/null ||
+        die "Python is not installed (required for archiving). Run the installer first: ./opc"
+}
+
+# ============================================================
+# UPLOAD SECRETS
+# ============================================================
+
+upload_secrets() {
+
+    if [[ -f "$API_KEY_FILE" ]]; then
+        log "Uploading API key..."
+
+        colab upload -s "$SESSION" \
+            "$API_KEY_FILE" \
+            /content/inception_api_key
+    fi
+
+    if [[ -f "$PROVIDER_FILE" ]]; then
+        log "Uploading provider config..."
+
+        colab upload -s "$SESSION" \
+            "$PROVIDER_FILE" \
+            /content/opc_provider.json
+    fi
+
+    log "Uploading GitHub SSH keys..."
+
+    colab upload -s "$SESSION" \
+        "$SSH_KEY_FILE" \
+        /content/.opc_github_key
+
+    colab upload -s "$SESSION" \
+        "$SSH_PUB_FILE" \
+        /content/.opc_github_key.pub
+}
+
+# ============================================================
+# REMOTE SETUP
+# ============================================================
+
+setup_opencode() {
+
+    log "Preparing remote environment..."
+
+    cat > "$TMP_DIR/setup.py" <<'PY'
+import os
+import re
+import json
+import shutil
+import subprocess
+from pathlib import Path
+
+home = Path.home()
+
+def run(command):
+    subprocess.run(command, check=True)
+
+# ------------------------------------------------------------
+# Install system dependencies
+# ------------------------------------------------------------
+
+required = ["git", "ssh", "ssh-keyscan", "curl"]
+
+missing = [
+    item for item in required
+    if shutil.which(item) is None
+]
+
+if missing:
+    print("[opc] Installing system dependencies...")
+    run(["apt-get", "update", "-qq"])
+    run([
+        "apt-get", "install", "-y", "-qq",
+        "git",
+        "openssh-client",
+        "curl",
+        "ca-certificates"
+    ])
+
+# ------------------------------------------------------------
+# Install OpenCode 2
+# ------------------------------------------------------------
+
+candidates = [
+    shutil.which("opencode2"),
+    str(home / ".opencode" / "bin" / "opencode2"),
+    str(home / ".local" / "bin" / "opencode2"),
+    str(home / ".opencode" / "bin" / "opencode"),
+    str(home / ".local" / "bin" / "opencode"),
+]
+
+binary = next(
+    (p for p in candidates if p and Path(p).is_file()),
+    None
+)
+
+if not binary:
+    print("[opc] Installing OpenCode 2...")
+    run([
+        "bash",
+        "-lc",
+        "curl -fsSL https://opencode.ai/v2/install | bash"
+    ])
+
+    candidates = [
+        shutil.which("opencode2"),
+        str(home / ".opencode" / "bin" / "opencode2"),
+        str(home / ".local" / "bin" / "opencode2"),
+        str(home / ".opencode" / "bin" / "opencode"),
+        str(home / ".local" / "bin" / "opencode"),
+    ]
+
+    binary = next(
+        (p for p in candidates if p and Path(p).is_file()),
+        None
+    )
+
+if not binary:
+    raise RuntimeError("OpenCode 2 binary not found.")
+
+version = subprocess.run(
+    [binary, "--version"],
+    capture_output=True,
+    text=True
+)
+
+version_text = (version.stdout + version.stderr).strip()
+
+print("[opc] OpenCode version:", version_text)
+
+if not re.search(r"(^|[^0-9])2\.", version_text):
+    raise RuntimeError(
+        "The installed binary is not confirmed as OpenCode 2. "
+        "Detected version: " + version_text
+    )
+
+# ------------------------------------------------------------
+# Load provider spec (if uploaded), else fall back to Inception
+# ------------------------------------------------------------
+
+opencode_config_dir = home / ".config" / "opencode"
+opencode_config_dir.mkdir(parents=True, exist_ok=True)
+
+provider = None
+provider_file = Path("/content/opc_provider.json")
+
+if provider_file.is_file():
+    try:
+        provider = json.loads(provider_file.read_text())
+    except Exception:
+        provider = None
+    provider_file.unlink(missing_ok=True)
+
+# ------------------------------------------------------------
+# Install API key
+# ------------------------------------------------------------
+
+api_env_var = ""
+api_key_file = None
+
+if provider is not None:
+    api_env_var = str(provider.get("env") or "")
+    stored_key = str(provider.get("api_key") or "")
+
+    if stored_key:
+        api_key_file = opencode_config_dir / "provider_key"
+        api_key_file.write_text(stored_key)
+        api_key_file.chmod(0o600)
+    elif (opencode_config_dir / "provider_key").is_file():
+        api_key_file = opencode_config_dir / "provider_key"
+else:
+    uploaded_api_key = Path("/content/inception_api_key")
+
+    if not uploaded_api_key.is_file():
+        raise RuntimeError("Inception API key was not uploaded.")
+
+    api_key = uploaded_api_key.read_text().strip()
+
+    if not api_key:
+        raise RuntimeError("Inception API key is empty.")
+
+    api_env_var = "INCEPTION_API_KEY"
+    api_key_file = opencode_config_dir / "inception_api_key"
+    api_key_file.write_text(api_key)
+    api_key_file.chmod(0o600)
+    uploaded_api_key.unlink(missing_ok=True)
+
+# ------------------------------------------------------------
+# Configure GitHub SSH
+# ------------------------------------------------------------
+
+ssh_dir = home / ".ssh"
+ssh_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+ssh_dir.chmod(0o700)
+
+private_source = Path("/content/.opc_github_key")
+public_source = Path("/content/.opc_github_key.pub")
+
+if not private_source.is_file():
+    raise RuntimeError("GitHub private key was not uploaded.")
+
+if not public_source.is_file():
+    raise RuntimeError("GitHub public key was not uploaded.")
+
+private_key = ssh_dir / "github_opencode"
+public_key = ssh_dir / "github_opencode.pub"
+
+shutil.copy2(private_source, private_key)
+shutil.copy2(public_source, public_key)
+
+private_key.chmod(0o600)
+public_key.chmod(0o644)
+
+# Remove temporary uploaded copies
+private_source.unlink(missing_ok=True)
+public_source.unlink(missing_ok=True)
+
+# SSH config
+ssh_config = ssh_dir / "config"
+
+ssh_config.write_text("""Host github.com
+    HostName github.com
+    User git
+    IdentityFile ~/.ssh/github_opencode
+    IdentitiesOnly yes
+    StrictHostKeyChecking accept-new
+    ServerAliveInterval 30
+""")
+
+ssh_config.chmod(0o600)
+
+# ------------------------------------------------------------
+# GitHub host key
+# ------------------------------------------------------------
+
+known_hosts = ssh_dir / "known_hosts"
+
+scan = subprocess.run(
+    ["ssh-keyscan", "-H", "github.com"],
+    capture_output=True,
+    text=True,
+    timeout=20
+)
+
+if scan.returncode == 0 and scan.stdout.strip():
+    with known_hosts.open("a") as f:
+        f.write(scan.stdout)
+
+known_hosts.chmod(0o600)
+
+# ------------------------------------------------------------
+# Configure Git to use SSH for GitHub
+# ------------------------------------------------------------
+
+run([
+    "git", "config", "--global",
+    "url.git@github.com:.insteadOf",
+    "https://github.com/"
+])
+
+# ------------------------------------------------------------
+# Check GitHub authentication
+# ------------------------------------------------------------
+
+auth = subprocess.run(
+    ["ssh", "-T", "git@github.com"],
+    capture_output=True,
+    text=True,
+    timeout=25
+)
+
+auth_text = auth.stdout + auth.stderr
+
+match = re.search(r"Hi ([^!]+)!", auth_text)
+
+if match:
+    username = match.group(1).strip()
+
+    print("[opc] GitHub authenticated as:", username)
+
+    existing_name = subprocess.run(
+        ["git", "config", "--global", "user.name"],
+        capture_output=True,
+        text=True
+    )
+
+    existing_email = subprocess.run(
+        ["git", "config", "--global", "user.email"],
+        capture_output=True,
+        text=True
+    )
+
+    if not existing_name.stdout.strip():
+        run([
+            "git", "config", "--global",
+            "user.name", username
+        ])
+
+    if not existing_email.stdout.strip():
+        run([
+            "git", "config", "--global",
+            "user.email",
+            username + "@users.noreply.github.com"
+        ])
+
+else:
+    print("[opc] WARNING: GitHub authentication not confirmed.")
+    print(auth_text)
+
+# ------------------------------------------------------------
+# OpenCode provider configuration
+# ------------------------------------------------------------
+
+if provider is not None:
+    prov_id = str(provider.get("name") or "custom")
+    pkg = str(provider.get("package") or "@opencode/ai/providers/openai-compatible")
+    base_url = str(provider.get("base_url") or "")
+    model_id = str(provider.get("model") or "")
+
+    if not model_id:
+        raise RuntimeError("Provider model is not specified.")
+
+    prov_cfg = {
+        "name": prov_id,
+        "package": pkg,
+    }
+
+    if api_env_var:
+        prov_cfg["env"] = [api_env_var]
+
+    if base_url:
+        prov_cfg["settings"] = {"baseURL": base_url}
+
+    prov_cfg["models"] = {
+        model_id: {
+            "name": model_id,
+            "limit": {
+                "context": int(provider.get("limit_context", 1000000)),
+                "output": int(provider.get("limit_output", 131072)),
+            },
+            "settings": {"reasoningEffort": "medium"},
+            "body": {"reasoning_effort": "medium"},
+        }
+    }
+
+    config = {
+        "$schema": "https://opencode.ai/config.json",
+        "model": f"{prov_id}/{model_id}",
+        "providers": {prov_id: prov_cfg},
+    }
+
+else:
+    config = {
+        "$schema": "https://opencode.ai/config.json",
+        "model": "inception/mercury-3",
+        "providers": {
+            "inception": {
+                "name": "Inception Labs",
+                "env": ["INCEPTION_API_KEY"],
+                "package": "@opencode/ai/providers/openai-compatible",
+                "settings": {
+                    "baseURL": "https://api.inceptionlabs.ai/v1"
+                },
+                "models": {
+                    "mercury-3": {
+                        "name": "Mercury 3",
+                        "limit": {
+                            "context": 1000000,
+                            "output": 131072
+                        },
+                        "settings": {
+                            "reasoningEffort": "medium"
+                        },
+                        "body": {
+                            "reasoning_effort": "medium"
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+(opencode_config_dir / "opencode.json").write_text(
+    json.dumps(config, indent=2)
+)
+
+# Preserve previously requested CLI preferences
+cli_config = {
+    "$schema": "https://opencode.ai/v2/cli.json",
+    "animations": True,
+    "session": {
+        "scrollbar": True,
+        "permissions": "autoaccept"
+    },
+    "scroll": {
+        "speed": 4.0,
+        "acceleration": True
+    },
+    "attention": {
+        "notifications": True,
+        "sound": True,
+        "volume": 1.0
+    }
+}
+
+(opencode_config_dir / "cli.json").write_text(
+    json.dumps(cli_config, indent=2)
+)
+
+# ------------------------------------------------------------
+# Bash autostart
+# ------------------------------------------------------------
+
+bashrc = home / ".bashrc"
+
+content = bashrc.read_text() if bashrc.exists() else ""
+
+marker = "# COLAB_OPENCODE_AUTOSTART"
+
+if marker in content:
+    content = content.split(marker)[0]
+
+env_export = ""
+if api_key_file is not None:
+    env_export = f'export {api_env_var}="$(cat \'{api_key_file}\')"'
+
+block = f"""
+{marker}
+
+export PATH="{home}/.opencode/bin:{home}/.local/bin:$PATH"
+{env_export}
+
+if [[ $- == *i* ]] && [[ -z "$COLAB_OPENCODE_RUNNING" ]]; then
+    export COLAB_OPENCODE_RUNNING=1
+    clear
+    "{binary}"
+fi
+"""
+
+bashrc.write_text(content.rstrip() + "\n\n" + block)
+
+print("[opc] Remote setup completed.")
+PY
+
+    colab exec -s "$SESSION" -f "$TMP_DIR/setup.py"
+}
+
+# ============================================================
+# UPLOAD INDIVIDUAL FILES
+# ============================================================
+
+upload_files() {
+
+    for file in "$@"; do
+
+        [[ -f "$file" ]] ||
+            die "File not found: $file"
+
+        local name
+        name="$(basename "$file")"
+
+        log "Uploading $name..."
+
+        colab upload -s "$SESSION" \
+            "$file" \
+            "/content/$name"
+    done
+}
+
+# ============================================================
+# UPLOAD ALL CURRENT DIRECTORY
+# ============================================================
+
+upload_all() {
+
+    log "Packing current directory..."
+
+    local archive="$TMP_DIR/opc_upload.zip"
+
+    "$PY" - "$PWD" "$archive" <<'PY'
+import os
+import sys
+import zipfile
+
+root = os.path.abspath(sys.argv[1])
+archive = sys.argv[2]
+
+with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as z:
+    for current, dirs, files in os.walk(root, followlinks=False):
+
+        dirs[:] = [
+            d for d in dirs
+            if not os.path.islink(os.path.join(current, d))
+        ]
+
+        for name in files:
+            path = os.path.join(current, name)
+
+            if os.path.islink(path):
+                continue
+
+            relative = os.path.relpath(path, root)
+            z.write(path, relative)
+
+print("[opc] Archive created.")
+PY
+
+    log "Uploading archive..."
+
+    colab upload -s "$SESSION" \
+        "$archive" \
+        /content/opc_upload.zip
+
+    cat > "$TMP_DIR/unpack.py" <<'PY'
+import zipfile
+from pathlib import Path
+
+archive = Path("/content/opc_upload.zip")
+destination = Path("/content").resolve()
+
+with zipfile.ZipFile(archive) as z:
+    for item in z.infolist():
+        target = (destination / item.filename).resolve()
+
+        if target != destination and destination not in target.parents:
+            raise RuntimeError("Unsafe archive path: " + item.filename)
+
+    z.extractall(destination)
+
+archive.unlink(missing_ok=True)
+
+print("[opc] Files extracted into /content.")
+PY
+
+    log "Extracting archive..."
+
+    colab exec -s "$SESSION" -f "$TMP_DIR/unpack.py"
+}
+
+# ============================================================
+# COLLECT REMOTE FILES
+# ============================================================
+
+collect_files() {
+
+    local stamp
+    stamp="$(date +%Y%m%d_%H%M%S)"
+
+    local remote_archive="/tmp/opc_workspace_${stamp}.zip"
+    local local_archive="$DOWNLOAD_DIR/opc_workspace_${stamp}.zip"
+
+    log "Packing remote workspace..."
+
+    cat > "$TMP_DIR/collect.py" <<PY
+import os
+import zipfile
+
+root = "/content"
+archive = "$remote_archive"
+
+with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as z:
+    for current, dirs, files in os.walk(root, followlinks=False):
+
+        dirs[:] = [
+            d for d in dirs
+            if not os.path.islink(os.path.join(current, d))
+        ]
+
+        for name in files:
+            path = os.path.join(current, name)
+
+            if os.path.islink(path):
+                continue
+
+            relative = os.path.relpath(path, root)
+            z.write(path, relative)
+
+print("[opc] Archive created:", archive)
+PY
+
+    colab exec -s "$SESSION" -f "$TMP_DIR/collect.py"
+
+    log "Downloading archive..."
+
+    colab download -s "$SESSION" \
+        "$remote_archive" \
+        "$local_archive"
+
+    log "Archive downloaded: $local_archive"
+
+    # Remove temporary remote archive
+    cat > "$TMP_DIR/remove_archive.py" <<PY
+from pathlib import Path
+Path("$remote_archive").unlink(missing_ok=True)
+PY
+
+    colab exec -s "$SESSION" -f "$TMP_DIR/remove_archive.py"
+}
+
+# ============================================================
+# MAIN
+# ============================================================
+
+case "${1:-}" in
+    -help|-sshkey|-provider|-api) ;;
+    *) ensure_session ;;
+esac
+
+case "${1:-}" in
+
+    -help)
+        show_help
+        exit 0
+        ;;
+
+    -sshkey)
+        set_sshkey_dir "${2:-}"
+        exit 0
+        ;;
+
+    -provider)
+        set_provider
+        exit 0
+        ;;
+
+    -api)
+        set_provider
+        exit 0
+        ;;
+
+    -new)
+        recreate_session
+        ;;
+
+    -collect)
+        collect_files
+        exit 0
+        ;;
+
+    -all)
+        check_local_files
+        ensure_provider
+        upload_secrets
+        setup_opencode
+        upload_all
+        ;;
+
+    "")
+        check_local_files
+        ensure_provider
+        upload_secrets
+        setup_opencode
+        ;;
+
+    *)
+        check_local_files
+        ensure_provider
+        upload_secrets
+        setup_opencode
+        upload_files "$@"
+        ;;
+
+esac
+
+clear
+log "Connecting to Colab..."
+
+colab ssh -s "$SESSION"
+EOF
+
+chmod +x ~/bin/opc
+
+echo "[opc] Cloud Linux is ready"
