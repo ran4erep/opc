@@ -46,17 +46,25 @@ run_as_root() {
     fi
 }
 
+is_termux() {
+    # Termux (Android): pkg существует только там, а имена пакетов
+    # отличаются от Debian (python вместо python3, openssh вместо
+    # openssh-client, pip встроен в python).
+    command -v pkg >/dev/null 2>&1
+}
+
 ensure_python() {
     command -v python3 >/dev/null 2>&1 && return 0
     command -v python >/dev/null 2>&1 && return 0
 
     echo "[opc] python3 not found, installing..."
 
-    if command -v apt-get >/dev/null 2>&1; then
+    if is_termux; then
+        pkg update -y
+        pkg install -y python curl ca-certificates
+    elif command -v apt-get >/dev/null 2>&1; then
         run_as_root apt-get update -qq
         run_as_root apt-get install -y -qq python3 python3-pip curl ca-certificates
-    elif command -v pkg >/dev/null 2>&1; then
-        pkg install -y python python-pip curl
     elif command -v dnf >/dev/null 2>&1; then
         run_as_root dnf install -y python3 python3-pip curl
     elif command -v pacman >/dev/null 2>&1; then
@@ -77,10 +85,11 @@ ensure_pip() {
 
     echo "[opc] pip not found, installing..."
 
-    if command -v apt-get >/dev/null 2>&1; then
+    if is_termux; then
+        # В Termux pip встроен в пакет python
+        pkg install -y python
+    elif command -v apt-get >/dev/null 2>&1; then
         run_as_root apt-get install -y -qq python3-pip
-    elif command -v pkg >/dev/null 2>&1; then
-        pkg install -y python-pip
     else
         echo "[opc] ERROR: cannot install pip automatically." >&2
         exit 1
@@ -90,6 +99,34 @@ ensure_pip() {
 ensure_colab_cli() {
     local py
     py="$(command -v python3 || command -v python)"
+
+    if is_termux; then
+        # Нативные зависимости — готовыми пакетами репозитория Termux,
+        # чтобы pip НЕ компилировал их из исходников.
+        pkg install -y python-cryptography python-rpds-py python-pyarrow clang git openssh
+
+        # tornado (нужен jupyter-client): быстро собирается из sdist, без rust.
+        "$py" -m pip install tornado
+
+        # CLI ставится ТОЛЬКО из колёс (--only-binary) + индекс TUR
+        # (оттуда берётся готовое колесо pydantic-core).
+        "$py" -m pip install --user \
+            --only-binary=:all: \
+            --extra-index-url https://termux-user-repository.github.io/pypi/ \
+            "google-colab-cli==0.6.0"
+
+        # Официальный форк jupyter-kernel-client (чистый Python) — без него
+        # colab падает в рантайме (нет API KernelClient).
+        "$py" -m pip install --user --no-deps --force-reinstall \
+            "git+https://github.com/googlecolab/jupyter-kernel-client.git@f18e982c3265df5e923aa9def101ab3fd737e139"
+
+        # main-ветка CLI: только она содержит команду `colab ssh`, которая
+        # нужна opc. keyring — её зависимость, которую pip не подтягивает
+        # из-за --no-deps.
+        "$py" -m pip install --user --no-deps \
+            "git+https://github.com/googlecolab/google-colab-cli.git"
+        "$py" -m pip install --user keyring keyrings.alt
+    fi
 
     if ! command -v colab >/dev/null 2>&1; then
         echo "[opc] Installing Google Colab CLI..."
@@ -104,16 +141,22 @@ ensure_colab_cli() {
             exit 1
         fi
     else
-        echo "[opc] Checking for Google Colab CLI updates..."
+        if is_termux; then
+            echo "[opc] Google Colab CLI already installed (Termux build). Skipping auto-update."
+        else
+            echo "[opc] Checking for Google Colab CLI updates..."
 
-        "$py" -m pip install --user --upgrade google-colab-cli --quiet 2>/dev/null || \
-        "$py" -m pip install --user --break-system-packages --upgrade google-colab-cli --quiet 2>/dev/null || true
+            "$py" -m pip install --user --upgrade google-colab-cli --quiet 2>/dev/null || \
+            "$py" -m pip install --user --break-system-packages --upgrade google-colab-cli --quiet 2>/dev/null || true
+        fi
     fi
 }
 
 ensure_path() {
     local rc
-    if [[ -f "$HOME/.bashrc" ]]; then
+    # В Termux bash читает только ~/.bashrc (а не ~/.profile),
+    # поэтому там всегда пишем именно в него.
+    if is_termux || [[ -f "$HOME/.bashrc" ]]; then
         rc="$HOME/.bashrc"
     else
         rc="$HOME/.profile"
@@ -257,11 +300,11 @@ ensure_ssh_keygen() {
 
     echo "[opc] Installing ssh-keygen (openssh-client)..."
 
-    if command -v apt-get >/dev/null 2>&1; then
+    if is_termux; then
+        pkg install -y openssh
+    elif command -v apt-get >/dev/null 2>&1; then
         run_as_root apt-get update -qq
         run_as_root apt-get install -y -qq openssh-client
-    elif command -v pkg >/dev/null 2>&1; then
-        pkg install -y openssh
     elif command -v dnf >/dev/null 2>&1; then
         run_as_root dnf install -y openssh-clients
     elif command -v pacman >/dev/null 2>&1; then
@@ -469,9 +512,23 @@ ensure_session() {
 
     local status
 
-    status="$(colab status -s "$SESSION" 2>&1 || true)"
+    if [[ ! -f "$HOME/.config/gcloud/application_default_credentials.json" ]]; then
+        log "First run: Google authorization is required."
+        log "If a URL appears below, open it in your browser, approve access,"
+        log "then copy the shown authorization code and paste it here (Enter)."
+    fi
 
-    if grep -Fq "Session '$SESSION' not found" <<< "$status"; then
+    tmp="$(mktemp)"
+    # Вывод colab обязательно показываем в терминале (там возникает ссылка
+    # авторизации и приглашение ввести код), а копию сохраняем для проверки.
+    colab status -s "$SESSION" 2>&1 | tee "$tmp" || true
+    status="$(<"$tmp")"
+    rm -f "$tmp"
+
+    # Убираем ANSI-цвета, иначе grep не находит строку
+    status="$(printf '%s' "$status" | sed 's/\x1b\[[0-9;]*m//g')"
+
+    if grep -Fq "not found" <<< "$status"; then
         log "Creating CPU session..."
         colab new -s "$SESSION"
     else
@@ -1381,9 +1438,19 @@ esac
 clear
 log "Connecting to Colab..."
 
-colab ssh -s "$SESSION"
+colab ssh -s "$SESSION" --identity "$SSH_KEY_FILE"
 EOF
 
+# В Termux нет /usr/bin/env (env лежит в $PREFIX/bin) — поэтому
+# переписываем первую строку (shebang) на реальный путь к bash.
+sed -i "1c #!$(command -v bash)" "$HOME/bin/opc"
+
 chmod +x ~/bin/opc
+
+# В Termux `opc` должен быть доступен в любом шелле — для этого
+# кладём симлинк в системный bin (он всегда в PATH).
+if is_termux; then
+    ln -sf "$HOME/bin/opc" "$PREFIX/bin/opc"
+fi
 
 echo "[opc] Cloud Linux is ready"
